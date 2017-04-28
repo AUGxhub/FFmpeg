@@ -551,6 +551,7 @@ extern const AVFilter ff_avf_showwavespic;
 extern const AVFilter ff_vaf_spectrumsynth;
 
 /* multimedia sources */
+extern const AVFilter ff_avsrc_avsynctest;
 extern const AVFilter ff_avsrc_amovie;
 extern const AVFilter ff_avsrc_movie;
 
