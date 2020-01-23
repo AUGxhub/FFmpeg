@@ -31,6 +31,7 @@ extern const char *ff_opencl_source_pad;
 extern const char *ff_opencl_source_tonemap;
 extern const char *ff_opencl_source_transpose;
 extern const char *ff_opencl_source_unsharp;
+extern const char *ff_opencl_source_v360;
 extern const char *ff_opencl_source_xfade;
 
 #endif /* AVFILTER_OPENCL_SOURCE_H */
