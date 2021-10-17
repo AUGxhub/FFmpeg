@@ -44,14 +44,28 @@ typedef struct BilateralContext {
     float alpha;
     float range_table[65536];
 
-    float *img_out_f;
-    float *img_temp;
-    float *map_factor_a;
-    float *map_factor_b;
-    float *slice_factor_a;
-    float *slice_factor_b;
-    float *line_factor_a;
-    float *line_factor_b;
+    int (*input_fun)(AVFilterContext *ctx, void *arg,
+                     int jobnr, int nb_jobs);
+
+    int (*output_fun)(AVFilterContext *ctx, void *arg,
+                      int jobnr, int nb_jobs);
+
+    int stride[4];
+
+    float *input[4];
+    float *output[4];
+
+    float *left_pass[4];
+    float *left_pass_factor[4];
+
+    float *right_pass[4];
+    float *right_pass_factor[4];
+
+    float *up_pass[4];
+    float *up_pass_factor[4];
+
+    float *down_pass[4];
+    float *down_pass_factor[4];
 } BilateralContext;
 
 #define OFFSET(x) offsetof(BilateralContext, x)
@@ -102,6 +116,416 @@ static int config_params(AVFilterContext *ctx)
     return 0;
 }
 
+typedef struct ThreadData {
+    AVFrame *in, *out;
+} ThreadData;
+
+static int left_pass(AVFilterContext *ctx, void *arg,
+                     int jobnr, int nb_jobs)
+{
+    BilateralContext *s = ctx->priv;
+    const float *range_table = s->range_table;
+    const float inv_alpha_f = 1.f - s->alpha;
+
+    for (int plane = 0; plane < s->nb_planes; plane++) {
+        const int height = s->planeheight[plane];
+        const int width = s->planewidth[plane];
+        const int slice_start = (height * jobnr) / nb_jobs;
+        const int slice_end = (height * (jobnr+1)) / nb_jobs;
+        const int src_linesize = s->stride[plane];
+        const float *src = s->input[plane] + slice_start * src_linesize;
+        const int left_pass_linesize = s->stride[plane];
+        const int left_pass_factor_linesize = s->stride[plane];
+        float *left_pass = s->left_pass[plane] + slice_start * left_pass_linesize;
+        float *left_pass_factor = s->left_pass_factor[plane] + slice_start * left_pass_factor_linesize;
+
+        if (!(s->planes & (1 << plane)))
+            continue;
+
+        for (int y = slice_start; y < slice_end; y++) {
+            left_pass_factor[0] = 1.f;
+            left_pass[0] = src[0];
+
+            for (int x = 1; x < width; x++) {
+                const int diff = fabsf(src[x] - src[x - 1]);
+                const float alpha_f = range_table[diff];
+
+                left_pass_factor[x] = inv_alpha_f + alpha_f * left_pass_factor[x - 1];
+                left_pass[x] = inv_alpha_f * src[x] + alpha_f * left_pass[x - 1];
+            }
+
+            src += src_linesize;
+            left_pass += left_pass_linesize;
+            left_pass_factor += left_pass_factor_linesize;
+        }
+    }
+
+    return 0;
+}
+
+static int right_pass(AVFilterContext *ctx, void *arg,
+                      int jobnr, int nb_jobs)
+{
+    BilateralContext *s = ctx->priv;
+    const float *range_table = s->range_table;
+    const float inv_alpha_f = 1.f - s->alpha;
+
+    for (int plane = 0; plane < s->nb_planes; plane++) {
+        const int height = s->planeheight[plane];
+        const int width = s->planewidth[plane];
+        const int slice_start = height - (height * (jobnr + 1)) / nb_jobs;
+        const int slice_end = height - 1 - (height * jobnr) / nb_jobs;
+        const int src_linesize = s->stride[plane];
+        const int right_pass_linesize = s->stride[plane];
+        const int right_pass_factor_linesize = s->stride[plane];
+        const float *src = s->input[plane] + slice_end * src_linesize;
+        float *right_pass = s->right_pass[plane] + slice_end * right_pass_linesize;
+        float *right_pass_factor = s->right_pass_factor[plane] + slice_end * right_pass_factor_linesize;
+
+        if (!(s->planes & (1 << plane)))
+            continue;
+
+        for (int y = slice_end; y >= slice_start; y--) {
+            right_pass_factor[width - 1] = 1.f;
+            right_pass[width - 1] = src[width - 1];
+
+            for (int x = width - 2; x >= 0; x--) {
+                const int diff = fabsf(src[x] - src[x + 1]);
+                const float alpha_f = range_table[diff];
+
+                right_pass_factor[x] = inv_alpha_f + alpha_f * right_pass_factor[x + 1];
+                right_pass[x] = inv_alpha_f * src[x] + alpha_f * right_pass[x + 1];
+            }
+
+            src -= src_linesize;
+            right_pass -= right_pass_linesize;
+            right_pass_factor -= right_pass_factor_linesize;
+        }
+    }
+
+    return 0;
+}
+
+static int vertical_pass(AVFilterContext *ctx, void *arg,
+                        int jobnr, int nb_jobs)
+{
+    BilateralContext *s = ctx->priv;
+
+    for (int plane = 0; plane < s->nb_planes; plane++) {
+        const int height = s->planeheight[plane];
+        const int width = s->planewidth[plane];
+        const int slice_start = (height * jobnr) / nb_jobs;
+        const int slice_end = (height * (jobnr+1)) / nb_jobs;
+        const int left_pass_linesize = s->stride[plane];
+        const int left_pass_factor_linesize = s->stride[plane];
+        const float *left_pass = ((const float *)s->left_pass[plane]) + slice_start * left_pass_linesize;
+        const float *left_pass_factor = ((const float *)s->left_pass_factor[plane]) + slice_start * left_pass_factor_linesize;
+        const int right_pass_linesize = s->stride[plane];
+        const int right_pass_factor_linesize = s->stride[plane];
+        const float *right_pass = ((const float *)s->right_pass[plane]) + slice_start * right_pass_linesize;
+        const float *right_pass_factor = ((const float *)s->right_pass_factor[plane]) + slice_start * right_pass_factor_linesize;
+        float *dst = (float *)left_pass;
+
+        if (!(s->planes & (1 << plane)))
+            continue;
+
+        for (int y = slice_start; y < slice_end; y++) {
+            for (int x = 0; x < width; x++) {
+                const float factor = 1.f / (left_pass_factor[x] + right_pass_factor[x]);
+                dst[x] = factor * (left_pass[x] + right_pass[x]);
+            }
+
+            dst += left_pass_linesize;
+            left_pass += left_pass_linesize;
+            left_pass_factor += left_pass_factor_linesize;
+            right_pass += right_pass_linesize;
+            right_pass_factor += right_pass_factor_linesize;
+        }
+    }
+
+    return 0;
+}
+
+static int down_pass(AVFilterContext *ctx, void *arg,
+                     int jobnr, int nb_jobs)
+{
+    BilateralContext *s = ctx->priv;
+    const float *range_table = s->range_table;
+    const float inv_alpha_f = 1.f - s->alpha;
+
+    for (int plane = 0; plane < s->nb_planes; plane++) {
+        const int height = s->planeheight[plane];
+        const int width = s->planewidth[plane];
+        const int slice_start = (width * jobnr) / nb_jobs;
+        const int slice_end = (width * (jobnr+1)) / nb_jobs;
+        const int src_linesize = s->stride[plane];
+        const int src_hor_linesize = s->stride[plane];
+        const float *src = (const float *)s->input[plane];
+        const float *src_hor = (const float *)s->left_pass[plane];
+        const int down_pass_linesize = s->stride[plane];
+        const int down_pass_factor_linesize = s->stride[plane];
+        float *down_pass = (float *)s->down_pass[plane];
+        float *down_pass_factor = (float *)s->down_pass_factor[plane];
+
+        if (!(s->planes & (1 << plane)))
+            continue;
+
+        for (int x = slice_start; x < slice_end; x++) {
+            down_pass_factor[x] = 1.f;
+            down_pass[x] = src_hor[x];
+        }
+
+        src += src_linesize;
+        src_hor += src_hor_linesize;
+        down_pass += down_pass_linesize;
+        down_pass_factor += down_pass_factor_linesize;
+
+        for (int y = 1; y < height; y++) {
+            for (int x = slice_start; x < slice_end; x++) {
+                const int diff = fabsf(src[x] - src[x - src_linesize]);
+                const float alpha_f = range_table[diff];
+
+                down_pass_factor[x] = inv_alpha_f + alpha_f * down_pass_factor[x - down_pass_factor_linesize];
+                down_pass[x] = inv_alpha_f * src_hor[x] + alpha_f * down_pass[x - down_pass_linesize];
+            }
+
+            src += src_linesize;
+            src_hor += src_hor_linesize;
+            down_pass += down_pass_linesize;
+            down_pass_factor += down_pass_factor_linesize;
+        }
+    }
+
+    return 0;
+}
+
+static int up_pass(AVFilterContext *ctx, void *arg,
+                   int jobnr, int nb_jobs)
+{
+    BilateralContext *s = ctx->priv;
+    const float *range_table = s->range_table;
+    const float inv_alpha_f = 1.f - s->alpha;
+
+    for (int plane = 0; plane < s->nb_planes; plane++) {
+        const int height = s->planeheight[plane];
+        const int width = s->planewidth[plane];
+        const int slice_start = width - (width * (jobnr + 1)) / nb_jobs;
+        const int slice_end = width - 1 - (width * jobnr) / nb_jobs;
+        const int src_linesize = s->stride[plane];
+        const int src_hor_linesize = s->stride[plane];
+        const float *src = (const float *)s->input[plane] + (height - 1) * src_linesize;
+        const float *src_hor = (const float *)s->left_pass[plane] + (height - 1) * src_hor_linesize;
+        const int up_pass_linesize = s->stride[plane];
+        const int up_pass_factor_linesize = s->stride[plane];
+        float *up_pass = ((float *)s->up_pass[plane]) + (height - 1) * up_pass_linesize;
+        float *up_pass_factor = ((float *)s->up_pass_factor[plane]) + (height - 1) * up_pass_factor_linesize;
+
+        if (!(s->planes & (1 << plane)))
+            continue;
+
+        for (int x = slice_end; x >= slice_start; x--) {
+            up_pass_factor[x] = 1.f;
+            up_pass[x] = src_hor[x];
+        }
+
+        src -= src_linesize;
+        src_hor -= src_hor_linesize;
+        up_pass -= up_pass_linesize;
+        up_pass_factor -= up_pass_factor_linesize;
+
+        for (int y = 1; y < height; y++) {
+            for (int x = slice_end; x >= slice_start; x--) {
+                const int diff = fabsf(src[x] - src[x + src_linesize]);
+                const float alpha_f = range_table[diff];
+
+                up_pass_factor[x] = inv_alpha_f + alpha_f * up_pass_factor[x + up_pass_factor_linesize];
+                up_pass[x] = inv_alpha_f * src_hor[x] + alpha_f * up_pass[x + up_pass_linesize];
+            }
+
+            src -= src_linesize;
+            src_hor -= src_hor_linesize;
+            up_pass -= up_pass_linesize;
+            up_pass_factor -= up_pass_factor_linesize;
+        }
+    }
+
+    return 0;
+}
+
+static int average_pass(AVFilterContext *ctx, void *arg,
+                        int jobnr, int nb_jobs)
+{
+    BilateralContext *s = ctx->priv;
+
+    for (int plane = 0; plane < s->nb_planes; plane++) {
+        const int height = s->planeheight[plane];
+        const int width = s->planewidth[plane];
+        const int slice_start = (height * jobnr) / nb_jobs;
+        const int slice_end = (height * (jobnr+1)) / nb_jobs;
+        const int dst_linesize = s->stride[plane];
+        float *dst = (float *)s->output[plane] + slice_start * dst_linesize;
+        const int down_pass_linesize = s->stride[plane];
+        const int down_pass_factor_linesize = s->stride[plane];
+        const int up_pass_linesize = s->stride[plane];
+        const int up_pass_factor_linesize = s->stride[plane];
+        const float *down_pass = ((const float *)s->down_pass[plane]) + slice_start * down_pass_linesize;
+        const float *down_pass_factor = ((const float *)s->down_pass_factor[plane]) + slice_start * down_pass_factor_linesize;
+        const float *up_pass = ((const float *)s->up_pass[plane]) + slice_start * up_pass_linesize;
+        const float *up_pass_factor = ((const float *)s->up_pass_factor[plane]) + slice_start * up_pass_factor_linesize;
+
+        for (int y = slice_start; y < slice_end; y++) {
+            for (int x = 0; x < width; x++)
+                dst[x] = (up_pass[x] + down_pass[x]) / (up_pass_factor[x] + down_pass_factor[x]);
+
+            dst += dst_linesize;
+            up_pass += up_pass_linesize;
+            up_pass_factor += up_pass_factor_linesize;
+            down_pass += down_pass_linesize;
+            down_pass_factor += down_pass_factor_linesize;
+        }
+    }
+
+    return 0;
+}
+
+static int input_pass(AVFilterContext *ctx, void *arg,
+                      int jobnr, int nb_jobs)
+{
+    BilateralContext *s = ctx->priv;
+    ThreadData *td = arg;
+    AVFrame *in = td->in;
+
+    for (int plane = 0; plane < s->nb_planes; plane++) {
+        const int height = s->planeheight[plane];
+        const int width = s->planewidth[plane];
+        const int slice_start = (height * jobnr) / nb_jobs;
+        const int slice_end = (height * (jobnr+1)) / nb_jobs;
+        const int src_linesize = in->linesize[plane];
+        const int dst_linesize = s->stride[plane];
+        const uint8_t *src = in->data[plane] + slice_start * src_linesize;
+        float *dst = (float *)s->input[plane] + slice_start * dst_linesize;
+
+        for (int y = slice_start; y < slice_end; y++) {
+            for (int x = 0; x < width; x++)
+                dst[x] = src[x];
+
+            dst += dst_linesize;
+            src += src_linesize;
+        }
+    }
+
+    return 0;
+}
+
+static int input_pass16(AVFilterContext *ctx, void *arg,
+                        int jobnr, int nb_jobs)
+{
+    BilateralContext *s = ctx->priv;
+    ThreadData *td = arg;
+    AVFrame *in = td->in;
+
+    for (int plane = 0; plane < s->nb_planes; plane++) {
+        const int height = s->planeheight[plane];
+        const int width = s->planewidth[plane];
+        const int slice_start = (height * jobnr) / nb_jobs;
+        const int slice_end = (height * (jobnr+1)) / nb_jobs;
+        const int src_linesize = in->linesize[plane] / 2;
+        const int dst_linesize = s->stride[plane];
+        const uint16_t *src = (const uint16_t *)in->data[plane] + slice_start * src_linesize;
+        float *dst = (float *)s->input[plane] + slice_start * dst_linesize;
+
+        for (int y = slice_start; y < slice_end; y++) {
+            for (int x = 0; x < width; x++)
+                dst[x] = src[x];
+
+            dst += dst_linesize;
+            src += src_linesize;
+        }
+    }
+
+    return 0;
+}
+
+
+static int output_pass(AVFilterContext *ctx, void *arg,
+                       int jobnr, int nb_jobs)
+{
+    BilateralContext *s = ctx->priv;
+    ThreadData *td = arg;
+    AVFrame *out = td->out;
+    AVFrame *in = td->in;
+
+    for (int plane = 0; plane < s->nb_planes; plane++) {
+        const int height = s->planeheight[plane];
+        const int width = s->planewidth[plane];
+        const int slice_start = (height * jobnr) / nb_jobs;
+        const int slice_end = (height * (jobnr+1)) / nb_jobs;
+        const int dst_linesize = out->linesize[plane];
+        const int orig_linesize = in->linesize[plane];
+        const int src_linesize = s->stride[plane];
+        const float *src = (const float *)s->output[plane] + slice_start * dst_linesize;
+        const uint8_t *orig = in->data[plane] + slice_start * orig_linesize;
+        uint8_t *dst = out->data[plane] + slice_start * src_linesize;
+
+         if (!(s->planes & (1 << plane))) {
+             if (in != out)
+                 av_image_copy_plane(dst, dst_linesize, orig, orig_linesize,
+                                     width * ((s->depth + 7) / 8), slice_end - slice_start);
+             continue;
+        }
+
+        for (int y = slice_start; y < slice_end; y++) {
+            for (int x = 0; x < width; x++)
+                dst[x] = av_clip_uint8(lrintf(src[x]));
+
+            dst += dst_linesize;
+            src += src_linesize;
+        }
+    }
+
+    return 0;
+}
+
+static int output_pass16(AVFilterContext *ctx, void *arg,
+                         int jobnr, int nb_jobs)
+{
+    BilateralContext *s = ctx->priv;
+    const int depth = s->depth;
+    ThreadData *td = arg;
+    AVFrame *out = td->out;
+    AVFrame *in = td->in;
+
+    for (int plane = 0; plane < s->nb_planes; plane++) {
+        const int height = s->planeheight[plane];
+        const int width = s->planewidth[plane];
+        const int slice_start = (height * jobnr) / nb_jobs;
+        const int slice_end = (height * (jobnr+1)) / nb_jobs;
+        const int dst_linesize = out->linesize[plane] / 2;
+        const int orig_linesize = in->linesize[plane];
+        const int src_linesize = s->stride[plane];
+        const float *src = (const float *)s->output[plane] + slice_start * dst_linesize;
+        const uint8_t *orig = in->data[plane] + slice_start * orig_linesize;
+        uint16_t *dst = (uint16_t *)out->data[plane] + slice_start * src_linesize;
+
+         if (!(s->planes & (1 << plane))) {
+             if (in != out)
+                 av_image_copy_plane((uint8_t *)dst, dst_linesize, orig, orig_linesize,
+                                     width * ((s->depth + 7) / 8), slice_end - slice_start);
+             continue;
+        }
+
+        for (int y = slice_start; y < slice_end; y++) {
+            for (int x = 0; x < width; x++)
+                dst[x] = av_clip_uintp2_c(lrintf(src[x]), depth);
+
+            dst += dst_linesize;
+            src += src_linesize;
+        }
+    }
+
+    return 0;
+}
+
 static int config_input(AVFilterLink *inlink)
 {
     AVFilterContext *ctx = inlink->dst;
@@ -119,211 +543,97 @@ static int config_input(AVFilterLink *inlink)
 
     s->nb_planes = av_pix_fmt_count_planes(inlink->format);
 
-    s->img_out_f = av_calloc(inlink->w * inlink->h, sizeof(float));
-    s->img_temp = av_calloc(inlink->w * inlink->h, sizeof(float));
-    s->map_factor_a = av_calloc(inlink->w * inlink->h, sizeof(float));
-    s->map_factor_b = av_calloc(inlink->w * inlink->h, sizeof(float));
-    s->slice_factor_a = av_calloc(inlink->w, sizeof(float));
-    s->slice_factor_b = av_calloc(inlink->w, sizeof(float));
-    s->line_factor_a = av_calloc(inlink->w, sizeof(float));
-    s->line_factor_b = av_calloc(inlink->w, sizeof(float));
+    s->input_fun  = s->depth <= 8 ? input_pass  : input_pass16;
+    s->output_fun = s->depth <= 8 ? output_pass : output_pass16;
 
-    if (!s->img_out_f ||
-        !s->img_temp ||
-        !s->map_factor_a ||
-        !s->map_factor_b ||
-        !s->slice_factor_a ||
-        !s->slice_factor_a ||
-        !s->line_factor_a ||
-        !s->line_factor_a)
-        return AVERROR(ENOMEM);
+    for (int p = 0; p < s->nb_planes; p++) {
+        int stride;
+
+        s->stride[p] = stride   = FFALIGN(s->planewidth[p], 16);
+        s->input[p]             = av_calloc(stride * s->planeheight[p], sizeof(float));
+        s->output[p]            = av_calloc(stride * s->planeheight[p], sizeof(float));
+        s->left_pass[p]         = av_calloc(stride * s->planeheight[p], sizeof(float));
+        s->left_pass_factor[p]  = av_calloc(stride * s->planeheight[p], sizeof(float));
+        s->right_pass[p]        = av_calloc(stride * s->planeheight[p], sizeof(float));
+        s->right_pass_factor[p] = av_calloc(stride * s->planeheight[p], sizeof(float));
+        s->up_pass[p]           = av_calloc(stride * s->planeheight[p], sizeof(float));
+        s->up_pass_factor[p]    = av_calloc(stride * s->planeheight[p], sizeof(float));
+        s->down_pass[p]         = av_calloc(stride * s->planeheight[p], sizeof(float));
+        s->down_pass_factor[p]  = av_calloc(stride * s->planeheight[p], sizeof(float));
+        if (!s->input[p]             ||
+            !s->output[p]            ||
+            !s->left_pass[p]         ||
+            !s->left_pass_factor[p]  ||
+            !s->right_pass[p]        ||
+            !s->right_pass_factor[p] ||
+            !s->up_pass[p]           ||
+            !s->up_pass_factor[p]    ||
+            !s->down_pass[p]         ||
+            !s->down_pass_factor[p])
+            return AVERROR(ENOMEM);
+    }
 
     return 0;
 }
 
-#define BILATERAL(type, name)                                                           \
-static void bilateral_##name(BilateralContext *s, const uint8_t *ssrc, uint8_t *ddst,   \
-                             float sigma_spatial, float sigma_range,                    \
-                             int width, int height, int src_linesize, int dst_linesize) \
-{                                                                                       \
-    type *dst = (type *)ddst;                                                           \
-    const type *src = (const type *)ssrc;                                               \
-    float *img_out_f = s->img_out_f, *img_temp = s->img_temp;                           \
-    float *map_factor_a = s->map_factor_a, *map_factor_b = s->map_factor_b;             \
-    float *slice_factor_a = s->slice_factor_a, *slice_factor_b = s->slice_factor_b;     \
-    float *line_factor_a = s->line_factor_a, *line_factor_b = s->line_factor_b;         \
-    const float *range_table = s->range_table;                                          \
-    const float alpha = s->alpha;                                                       \
-    float ypr, ycr, *ycy, *ypy, *xcy, fp, fc;                                           \
-    const float inv_alpha_ = 1.f - alpha;                                               \
-    float *ycf, *ypf, *xcf, *in_factor;                                                 \
-    const type *tcy, *tpy;                                                                \
-    int h1;                                                                               \
-                                                                                          \
-    for (int y = 0; y < height; y++) {                                                    \
-        float *temp_factor_x, *temp_x = &img_temp[y * width];                             \
-        const type *in_x = &src[y * src_linesize];                                        \
-        const type *texture_x = &src[y * src_linesize];                                   \
-        type tpr;                                                                         \
-                                                                                          \
-        *temp_x++ = ypr = *in_x++;                                                        \
-        tpr = *texture_x++;                                                               \
-                                                                                          \
-        temp_factor_x = &map_factor_a[y * width];                                         \
-        *temp_factor_x++ = fp = 1;                                                        \
-                                                                                          \
-        for (int x = 1; x < width; x++) {                                                 \
-            float alpha_;                                                                 \
-            int range_dist;                                                               \
-            type tcr = *texture_x++;                                                      \
-            type dr = abs(tcr - tpr);                                                     \
-                                                                                          \
-            range_dist = dr;                                                              \
-            alpha_ = range_table[range_dist];                                             \
-            *temp_x++ = ycr = inv_alpha_*(*in_x++) + alpha_*ypr;                          \
-            tpr = tcr;                                                                    \
-            ypr = ycr;                                                                    \
-            *temp_factor_x++ = fc = inv_alpha_ + alpha_ * fp;                             \
-            fp = fc;                                                                      \
-        }                                                                                 \
-        --temp_x; *temp_x = 0.5f*((*temp_x) + (*--in_x));                                 \
-        tpr = *--texture_x;                                                               \
-        ypr = *in_x;                                                                      \
-                                                                                          \
-        --temp_factor_x; *temp_factor_x = 0.5f*((*temp_factor_x) + 1);                    \
-        fp = 1;                                                                           \
-                                                                                          \
-        for (int x = width - 2; x >= 0; x--) {                                            \
-            type tcr = *--texture_x;                                                      \
-            type dr = abs(tcr - tpr);                                                     \
-            int range_dist = dr;                                                          \
-            float alpha_ = range_table[range_dist];                                       \
-                                                                                          \
-            ycr = inv_alpha_ * (*--in_x) + alpha_ * ypr;                                  \
-            --temp_x; *temp_x = 0.5f*((*temp_x) + ycr);                                   \
-            tpr = tcr;                                                                    \
-            ypr = ycr;                                                                    \
-                                                                                          \
-            fc = inv_alpha_ + alpha_*fp;                                                  \
-            --temp_factor_x;                                                              \
-            *temp_factor_x = 0.5f*((*temp_factor_x) + fc);                                \
-            fp = fc;                                                                      \
-        }                                                                                 \
-    }                                                                                     \
-    memcpy(img_out_f, img_temp, sizeof(float) * width);                                   \
-                                                                                          \
-    in_factor = map_factor_a;                                                             \
-    memcpy(map_factor_b, in_factor, sizeof(float) * width);                               \
-    for (int y = 1; y < height; y++) {                                                    \
-        tpy = &src[(y - 1) * src_linesize];                                               \
-        tcy = &src[y * src_linesize];                                                     \
-        xcy = &img_temp[y * width];                                                       \
-        ypy = &img_out_f[(y - 1) * width];                                                \
-        ycy = &img_out_f[y * width];                                                      \
-                                                                                          \
-        xcf = &in_factor[y * width];                                                      \
-        ypf = &map_factor_b[(y - 1) * width];                                             \
-        ycf = &map_factor_b[y * width];                                                   \
-        for (int x = 0; x < width; x++) {                                                 \
-            type dr = abs((*tcy++) - (*tpy++));                                           \
-            int range_dist = dr;                                                          \
-            float alpha_ = range_table[range_dist];                                       \
-                                                                                          \
-            *ycy++ = inv_alpha_*(*xcy++) + alpha_*(*ypy++);                               \
-            *ycf++ = inv_alpha_*(*xcf++) + alpha_*(*ypf++);                               \
-        }                                                                                 \
-    }                                                                                     \
-    h1 = height - 1;                                                                      \
-    ycf = line_factor_a;                                                                  \
-    ypf = line_factor_b;                                                                  \
-    memcpy(ypf, &in_factor[h1 * width], sizeof(float) * width);                           \
-    for (int x = 0; x < width; x++)                                                       \
-        map_factor_b[h1 * width + x] = 0.5f*(map_factor_b[h1 * width + x] + ypf[x]);      \
-                                                                                          \
-    ycy = slice_factor_a;                                                                 \
-    ypy = slice_factor_b;                                                                 \
-    memcpy(ypy, &img_temp[h1 * width], sizeof(float) * width);                            \
-    for (int x = 0, k = 0; x < width; x++) {                                              \
-        int idx = h1 * width + x;                                                         \
-        img_out_f[idx] = 0.5f*(img_out_f[idx] + ypy[k++]) / map_factor_b[h1 * width + x]; \
-    }                                                                                     \
-                                                                                          \
-    for (int y = h1 - 1; y >= 0; y--) {                                                   \
-        float *ycf_, *ypf_, *factor_;                                                     \
-        float *ycy_, *ypy_, *out_;                                                        \
-                                                                                          \
-        tpy = &src[(y + 1) * src_linesize];                                               \
-        tcy = &src[y * src_linesize];                                                     \
-        xcy = &img_temp[y * width];                                                       \
-        ycy_ = ycy;                                                                       \
-        ypy_ = ypy;                                                                       \
-        out_ = &img_out_f[y * width];                                                     \
-                                                                                          \
-        xcf = &in_factor[y * width];                                                      \
-        ycf_ = ycf;                                                                       \
-        ypf_ = ypf;                                                                       \
-        factor_ = &map_factor_b[y * width];                                               \
-        for (int x = 0; x < width; x++) {                                                 \
-            type dr = abs((*tcy++) - (*tpy++));                                           \
-            int range_dist = dr;                                                          \
-            float alpha_ = range_table[range_dist];                                       \
-            float ycc, fcc = inv_alpha_*(*xcf++) + alpha_*(*ypf_++);                      \
-                                                                                          \
-            *ycf_++ = fcc;                                                                \
-            *factor_ = 0.5f * (*factor_ + fcc);                                           \
-                                                                                          \
-            ycc = inv_alpha_*(*xcy++) + alpha_*(*ypy_++);                                 \
-            *ycy_++ = ycc;                                                                \
-            *out_ = 0.5f * (*out_ + ycc) / (*factor_);                                    \
-            out_++;                                                                       \
-            factor_++;                                                                    \
-        }                                                                                 \
-                                                                                          \
-        ypy = ycy;                                                                        \
-        ypf = ycf;                                                                        \
-    }                                                                                     \
-                                                                                          \
-    for (int i = 0; i < height; i++)                                                      \
-        for (int j = 0; j < width; j++)                                                   \
-            dst[j + i * dst_linesize] = img_out_f[i * width + j];                         \
-}
+static int bilateral_planes(AVFilterContext *ctx,
+                            AVFrame *out,
+                            AVFrame *in)
+{
+    BilateralContext *s = ctx->priv;
+    const int nb_threads = ff_filter_get_nb_threads(ctx);
+    ThreadData td;
 
-BILATERAL(uint8_t, byte)
-BILATERAL(uint16_t, word)
+    td.in = in;
+    td.out = out;
+    ff_filter_execute(ctx, s->input_fun, &td, NULL,
+                      FFMIN(s->planeheight[1], nb_threads));
+
+    ff_filter_execute(ctx, left_pass, NULL, NULL,
+                      FFMIN(s->planeheight[1], nb_threads));
+
+    ff_filter_execute(ctx, right_pass, NULL, NULL,
+                      FFMIN(s->planeheight[1], nb_threads));
+
+    ff_filter_execute(ctx, vertical_pass, NULL, NULL,
+                      FFMIN(s->planeheight[1], nb_threads));
+
+    ff_filter_execute(ctx, down_pass, NULL, NULL,
+                      FFMIN(s->planewidth[1], nb_threads));
+
+    ff_filter_execute(ctx, up_pass, NULL, NULL,
+                      FFMIN(s->planewidth[1], nb_threads));
+
+    ff_filter_execute(ctx, average_pass, NULL, NULL,
+                      FFMIN(s->planeheight[1], nb_threads));
+
+    ff_filter_execute(ctx, s->output_fun, &td, NULL,
+                      FFMIN(s->planeheight[1], nb_threads));
+
+    return 0;
+}
 
 static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 {
     AVFilterContext *ctx = inlink->dst;
-    BilateralContext *s = ctx->priv;
     AVFilterLink *outlink = ctx->outputs[0];
     AVFrame *out;
 
-    out = ff_get_video_buffer(outlink, outlink->w, outlink->h);
-    if (!out) {
-        av_frame_free(&in);
-        return AVERROR(ENOMEM);
-    }
-    av_frame_copy_props(out, in);
-
-    for (int plane = 0; plane < s->nb_planes; plane++) {
-        if (!(s->planes & (1 << plane))) {
-            av_image_copy_plane(out->data[plane], out->linesize[plane],
-                                in->data[plane], in->linesize[plane],
-                                s->planewidth[plane] * ((s->depth + 7) / 8), s->planeheight[plane]);
-            continue;
+    if (av_frame_is_writable(in)) {
+        out = in;
+    } else {
+        out = ff_get_video_buffer(outlink, outlink->w, outlink->h);
+        if (!out) {
+            av_frame_free(&in);
+            return AVERROR(ENOMEM);
         }
-
-        if (s->depth <= 8)
-           bilateral_byte(s, in->data[plane], out->data[plane], s->sigmaS, s->sigmaR,
-                      s->planewidth[plane], s->planeheight[plane],
-                      in->linesize[plane], out->linesize[plane]);
-        else
-           bilateral_word(s, in->data[plane], out->data[plane], s->sigmaS, s->sigmaR,
-                      s->planewidth[plane], s->planeheight[plane],
-                      in->linesize[plane] / 2, out->linesize[plane] / 2);
+        av_frame_copy_props(out, in);
     }
 
-    av_frame_free(&in);
+    bilateral_planes(ctx, out, in);
+
+    if (out != in)
+        av_frame_free(&in);
     return ff_filter_frame(outlink, out);
 }
 
@@ -331,14 +641,22 @@ static av_cold void uninit(AVFilterContext *ctx)
 {
     BilateralContext *s = ctx->priv;
 
-    av_freep(&s->img_out_f);
-    av_freep(&s->img_temp);
-    av_freep(&s->map_factor_a);
-    av_freep(&s->map_factor_b);
-    av_freep(&s->slice_factor_a);
-    av_freep(&s->slice_factor_b);
-    av_freep(&s->line_factor_a);
-    av_freep(&s->line_factor_b);
+    for (int p = 0; p < s->nb_planes; p++) {
+        av_freep(&s->input[p]);
+        av_freep(&s->output[p]);
+
+        av_freep(&s->left_pass[p]);
+        av_freep(&s->left_pass_factor[p]);
+
+        av_freep(&s->right_pass[p]);
+        av_freep(&s->right_pass_factor[p]);
+
+        av_freep(&s->up_pass[p]);
+        av_freep(&s->up_pass_factor[p]);
+
+        av_freep(&s->down_pass[p]);
+        av_freep(&s->down_pass_factor[p]);
+    }
 }
 
 static int process_command(AVFilterContext *ctx,
@@ -381,6 +699,7 @@ const AVFilter ff_vf_bilateral = {
     FILTER_INPUTS(bilateral_inputs),
     FILTER_OUTPUTS(bilateral_outputs),
     FILTER_PIXFMTS_ARRAY(pix_fmts),
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
+    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC |
+                     AVFILTER_FLAG_SLICE_THREADS,
     .process_command = process_command,
 };
