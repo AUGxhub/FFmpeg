@@ -28,45 +28,7 @@
 #include "formats.h"
 #include "internal.h"
 #include "video.h"
-
-typedef struct BilateralContext {
-    const AVClass *class;
-
-    float sigmaS;
-    float sigmaR;
-    int planes;
-
-    int nb_planes;
-    int depth;
-    int planewidth[4];
-    int planeheight[4];
-
-    float alpha;
-    float range_table[65536];
-
-    int (*input_fun)(AVFilterContext *ctx, void *arg,
-                     int jobnr, int nb_jobs);
-
-    int (*output_fun)(AVFilterContext *ctx, void *arg,
-                      int jobnr, int nb_jobs);
-
-    int stride[4];
-
-    float *input[4];
-    float *output[4];
-
-    float *left_pass[4];
-    float *left_pass_factor[4];
-
-    float *right_pass[4];
-    float *right_pass_factor[4];
-
-    float *up_pass[4];
-    float *up_pass_factor[4];
-
-    float *down_pass[4];
-    float *down_pass_factor[4];
-} BilateralContext;
+#include "bilateral.h"
 
 #define OFFSET(x) offsetof(BilateralContext, x)
 #define FLAGS AV_OPT_FLAG_VIDEO_PARAM|AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_RUNTIME_PARAM
@@ -132,12 +94,11 @@ static int left_pass(AVFilterContext *ctx, void *arg,
         const int width = s->planewidth[plane];
         const int slice_start = (height * jobnr) / nb_jobs;
         const int slice_end = (height * (jobnr+1)) / nb_jobs;
-        const int src_linesize = s->stride[plane];
-        const float *src = s->input[plane] + slice_start * src_linesize;
-        const int left_pass_linesize = s->stride[plane];
-        const int left_pass_factor_linesize = s->stride[plane];
-        float *left_pass = s->left_pass[plane] + slice_start * left_pass_linesize;
-        float *left_pass_factor = s->left_pass_factor[plane] + slice_start * left_pass_factor_linesize;
+        const int linesize = s->stride[plane];
+        const float *src = s->input[plane] + slice_start * linesize;
+        const uint16_t *hderivative = s->hderivative[plane] + slice_start * linesize;
+        float *left_pass = s->left_pass[plane] + slice_start * linesize;
+        float *left_pass_factor = s->left_pass_factor[plane] + slice_start * linesize;
 
         if (!(s->planes & (1 << plane)))
             continue;
@@ -147,16 +108,16 @@ static int left_pass(AVFilterContext *ctx, void *arg,
             left_pass[0] = src[0];
 
             for (int x = 1; x < width; x++) {
-                const int diff = fabsf(src[x] - src[x - 1]);
-                const float alpha_f = range_table[diff];
+                const float alpha_f = range_table[hderivative[x - 1]];
 
                 left_pass_factor[x] = inv_alpha_f + alpha_f * left_pass_factor[x - 1];
                 left_pass[x] = inv_alpha_f * src[x] + alpha_f * left_pass[x - 1];
             }
 
-            src += src_linesize;
-            left_pass += left_pass_linesize;
-            left_pass_factor += left_pass_factor_linesize;
+            src += linesize;
+            left_pass += linesize;
+            left_pass_factor += linesize;
+            hderivative += linesize;
         }
     }
 
@@ -175,12 +136,11 @@ static int right_pass(AVFilterContext *ctx, void *arg,
         const int width = s->planewidth[plane];
         const int slice_start = height - (height * (jobnr + 1)) / nb_jobs;
         const int slice_end = height - 1 - (height * jobnr) / nb_jobs;
-        const int src_linesize = s->stride[plane];
-        const int right_pass_linesize = s->stride[plane];
-        const int right_pass_factor_linesize = s->stride[plane];
-        const float *src = s->input[plane] + slice_end * src_linesize;
-        float *right_pass = s->right_pass[plane] + slice_end * right_pass_linesize;
-        float *right_pass_factor = s->right_pass_factor[plane] + slice_end * right_pass_factor_linesize;
+        const int linesize = s->stride[plane];
+        const float *src = s->input[plane] + slice_end * linesize;
+        const uint16_t *hderivative = s->hderivative[plane] + slice_end * linesize;
+        float *right_pass = s->right_pass[plane] + slice_end * linesize;
+        float *right_pass_factor = s->right_pass_factor[plane] + slice_end * linesize;
 
         if (!(s->planes & (1 << plane)))
             continue;
@@ -190,20 +150,29 @@ static int right_pass(AVFilterContext *ctx, void *arg,
             right_pass[width - 1] = src[width - 1];
 
             for (int x = width - 2; x >= 0; x--) {
-                const int diff = fabsf(src[x] - src[x + 1]);
-                const float alpha_f = range_table[diff];
+                const float alpha_f = range_table[hderivative[x]];
 
                 right_pass_factor[x] = inv_alpha_f + alpha_f * right_pass_factor[x + 1];
                 right_pass[x] = inv_alpha_f * src[x] + alpha_f * right_pass[x + 1];
             }
 
-            src -= src_linesize;
-            right_pass -= right_pass_linesize;
-            right_pass_factor -= right_pass_factor_linesize;
+            src -= linesize;
+            right_pass -= linesize;
+            right_pass_factor -= linesize;
+            hderivative -= linesize;
         }
     }
 
     return 0;
+}
+
+static void sum_and_div_float_c(float *dst,
+                                const float *num0, const float *num1,
+                                const float *den0, const float *den1,
+                                int width)
+{
+    for (int x = 0; x < width; x++)
+        dst[x] = (num0[x] + num1[x]) / (den0[x] + den1[x]);
 }
 
 static int vertical_pass(AVFilterContext *ctx, void *arg,
@@ -213,33 +182,29 @@ static int vertical_pass(AVFilterContext *ctx, void *arg,
 
     for (int plane = 0; plane < s->nb_planes; plane++) {
         const int height = s->planeheight[plane];
-        const int width = s->planewidth[plane];
         const int slice_start = (height * jobnr) / nb_jobs;
         const int slice_end = (height * (jobnr+1)) / nb_jobs;
-        const int left_pass_linesize = s->stride[plane];
-        const int left_pass_factor_linesize = s->stride[plane];
-        const float *left_pass = ((const float *)s->left_pass[plane]) + slice_start * left_pass_linesize;
-        const float *left_pass_factor = ((const float *)s->left_pass_factor[plane]) + slice_start * left_pass_factor_linesize;
-        const int right_pass_linesize = s->stride[plane];
-        const int right_pass_factor_linesize = s->stride[plane];
-        const float *right_pass = ((const float *)s->right_pass[plane]) + slice_start * right_pass_linesize;
-        const float *right_pass_factor = ((const float *)s->right_pass_factor[plane]) + slice_start * right_pass_factor_linesize;
+        const int linesize = s->stride[plane];
+        const float *left_pass = ((const float *)s->left_pass[plane]) + slice_start * linesize;
+        const float *left_pass_factor = ((const float *)s->left_pass_factor[plane]) + slice_start * linesize;
+        const float *right_pass = ((const float *)s->right_pass[plane]) + slice_start * linesize;
+        const float *right_pass_factor = ((const float *)s->right_pass_factor[plane]) + slice_start * linesize;
         float *dst = (float *)left_pass;
 
         if (!(s->planes & (1 << plane)))
             continue;
 
         for (int y = slice_start; y < slice_end; y++) {
-            for (int x = 0; x < width; x++) {
-                const float factor = 1.f / (left_pass_factor[x] + right_pass_factor[x]);
-                dst[x] = factor * (left_pass[x] + right_pass[x]);
-            }
+            s->sum_and_div_float(dst,
+                                 left_pass, right_pass,
+                                 left_pass_factor, right_pass_factor,
+                                 linesize);
 
-            dst += left_pass_linesize;
-            left_pass += left_pass_linesize;
-            left_pass_factor += left_pass_factor_linesize;
-            right_pass += right_pass_linesize;
-            right_pass_factor += right_pass_factor_linesize;
+            dst += linesize;
+            left_pass += linesize;
+            left_pass_factor += linesize;
+            right_pass += linesize;
+            right_pass_factor += linesize;
         }
     }
 
@@ -258,12 +223,10 @@ static int down_pass(AVFilterContext *ctx, void *arg,
         const int width = s->planewidth[plane];
         const int slice_start = (width * jobnr) / nb_jobs;
         const int slice_end = (width * (jobnr+1)) / nb_jobs;
-        const int src_linesize = s->stride[plane];
-        const int src_hor_linesize = s->stride[plane];
+        const int linesize = s->stride[plane];
         const float *src = (const float *)s->input[plane];
         const float *src_hor = (const float *)s->left_pass[plane];
-        const int down_pass_linesize = s->stride[plane];
-        const int down_pass_factor_linesize = s->stride[plane];
+        const uint16_t *vderivative = s->vderivative[plane];
         float *down_pass = (float *)s->down_pass[plane];
         float *down_pass_factor = (float *)s->down_pass_factor[plane];
 
@@ -275,24 +238,24 @@ static int down_pass(AVFilterContext *ctx, void *arg,
             down_pass[x] = src_hor[x];
         }
 
-        src += src_linesize;
-        src_hor += src_hor_linesize;
-        down_pass += down_pass_linesize;
-        down_pass_factor += down_pass_factor_linesize;
+        src += linesize;
+        src_hor += linesize;
+        down_pass += linesize;
+        down_pass_factor += linesize;
 
         for (int y = 1; y < height; y++) {
             for (int x = slice_start; x < slice_end; x++) {
-                const int diff = fabsf(src[x] - src[x - src_linesize]);
-                const float alpha_f = range_table[diff];
+                const float alpha_f = range_table[vderivative[x]];
 
-                down_pass_factor[x] = inv_alpha_f + alpha_f * down_pass_factor[x - down_pass_factor_linesize];
-                down_pass[x] = inv_alpha_f * src_hor[x] + alpha_f * down_pass[x - down_pass_linesize];
+                down_pass_factor[x] = inv_alpha_f + alpha_f * down_pass_factor[x - linesize];
+                down_pass[x] = inv_alpha_f * src_hor[x] + alpha_f * down_pass[x - linesize];
             }
 
-            src += src_linesize;
-            src_hor += src_hor_linesize;
-            down_pass += down_pass_linesize;
-            down_pass_factor += down_pass_factor_linesize;
+            src += linesize;
+            src_hor += linesize;
+            down_pass += linesize;
+            down_pass_factor += linesize;
+            vderivative += linesize;
         }
     }
 
@@ -311,14 +274,12 @@ static int up_pass(AVFilterContext *ctx, void *arg,
         const int width = s->planewidth[plane];
         const int slice_start = width - (width * (jobnr + 1)) / nb_jobs;
         const int slice_end = width - 1 - (width * jobnr) / nb_jobs;
-        const int src_linesize = s->stride[plane];
-        const int src_hor_linesize = s->stride[plane];
-        const float *src = (const float *)s->input[plane] + (height - 1) * src_linesize;
-        const float *src_hor = (const float *)s->left_pass[plane] + (height - 1) * src_hor_linesize;
-        const int up_pass_linesize = s->stride[plane];
-        const int up_pass_factor_linesize = s->stride[plane];
-        float *up_pass = ((float *)s->up_pass[plane]) + (height - 1) * up_pass_linesize;
-        float *up_pass_factor = ((float *)s->up_pass_factor[plane]) + (height - 1) * up_pass_factor_linesize;
+        const int linesize = s->stride[plane];
+        const float *src = (const float *)s->input[plane] + (height - 1) * linesize;
+        const float *src_hor = (const float *)s->left_pass[plane] + (height - 1) * linesize;
+        const uint16_t *vderivative = s->vderivative[plane] + (height - 2) * linesize;
+        float *up_pass = ((float *)s->up_pass[plane]) + (height - 1) * linesize;
+        float *up_pass_factor = ((float *)s->up_pass_factor[plane]) + (height - 1) * linesize;
 
         if (!(s->planes & (1 << plane)))
             continue;
@@ -328,24 +289,24 @@ static int up_pass(AVFilterContext *ctx, void *arg,
             up_pass[x] = src_hor[x];
         }
 
-        src -= src_linesize;
-        src_hor -= src_hor_linesize;
-        up_pass -= up_pass_linesize;
-        up_pass_factor -= up_pass_factor_linesize;
+        src -= linesize;
+        src_hor -= linesize;
+        up_pass -= linesize;
+        up_pass_factor -= linesize;
 
         for (int y = 1; y < height; y++) {
             for (int x = slice_end; x >= slice_start; x--) {
-                const int diff = fabsf(src[x] - src[x + src_linesize]);
-                const float alpha_f = range_table[diff];
+                const float alpha_f = range_table[vderivative[x]];
 
-                up_pass_factor[x] = inv_alpha_f + alpha_f * up_pass_factor[x + up_pass_factor_linesize];
-                up_pass[x] = inv_alpha_f * src_hor[x] + alpha_f * up_pass[x + up_pass_linesize];
+                up_pass_factor[x] = inv_alpha_f + alpha_f * up_pass_factor[x + linesize];
+                up_pass[x] = inv_alpha_f * src_hor[x] + alpha_f * up_pass[x + linesize];
             }
 
-            src -= src_linesize;
-            src_hor -= src_hor_linesize;
-            up_pass -= up_pass_linesize;
-            up_pass_factor -= up_pass_factor_linesize;
+            src -= linesize;
+            src_hor -= linesize;
+            up_pass -= linesize;
+            up_pass_factor -= linesize;
+            vderivative -= linesize;
         }
     }
 
@@ -359,29 +320,157 @@ static int average_pass(AVFilterContext *ctx, void *arg,
 
     for (int plane = 0; plane < s->nb_planes; plane++) {
         const int height = s->planeheight[plane];
+        const int slice_start = (height * jobnr) / nb_jobs;
+        const int slice_end = (height * (jobnr+1)) / nb_jobs;
+        const int linesize = s->stride[plane];
+        float *dst = (float *)s->output[plane] + slice_start * linesize;
+        const float *down_pass = ((const float *)s->down_pass[plane]) + slice_start * linesize;
+        const float *down_pass_factor = ((const float *)s->down_pass_factor[plane]) + slice_start * linesize;
+        const float *up_pass = ((const float *)s->up_pass[plane]) + slice_start * linesize;
+        const float *up_pass_factor = ((const float *)s->up_pass_factor[plane]) + slice_start * linesize;
+
+        if (!(s->planes & (1 << plane)))
+            continue;
+
+        for (int y = slice_start; y < slice_end; y++) {
+            s->sum_and_div_float(dst,
+                                 up_pass, down_pass,
+                                 up_pass_factor, down_pass_factor,
+                                 linesize);
+
+            dst += linesize;
+            up_pass += linesize;
+            up_pass_factor += linesize;
+            down_pass += linesize;
+            down_pass_factor += linesize;
+        }
+    }
+
+    return 0;
+}
+
+static int hderivative(AVFilterContext *ctx, void *arg,
+                       int jobnr, int nb_jobs)
+{
+    BilateralContext *s = ctx->priv;
+    ThreadData *td = arg;
+    AVFrame *in = td->in;
+
+    for (int plane = 0; plane < s->nb_planes; plane++) {
+        const int height = s->planeheight[plane];
         const int width = s->planewidth[plane];
         const int slice_start = (height * jobnr) / nb_jobs;
         const int slice_end = (height * (jobnr+1)) / nb_jobs;
-        const int dst_linesize = s->stride[plane];
-        float *dst = (float *)s->output[plane] + slice_start * dst_linesize;
-        const int down_pass_linesize = s->stride[plane];
-        const int down_pass_factor_linesize = s->stride[plane];
-        const int up_pass_linesize = s->stride[plane];
-        const int up_pass_factor_linesize = s->stride[plane];
-        const float *down_pass = ((const float *)s->down_pass[plane]) + slice_start * down_pass_linesize;
-        const float *down_pass_factor = ((const float *)s->down_pass_factor[plane]) + slice_start * down_pass_factor_linesize;
-        const float *up_pass = ((const float *)s->up_pass[plane]) + slice_start * up_pass_linesize;
-        const float *up_pass_factor = ((const float *)s->up_pass_factor[plane]) + slice_start * up_pass_factor_linesize;
+        const int src_linesize = in->linesize[plane];
+        const int linesize = s->stride[plane];
+        const uint8_t *src = in->data[plane] + slice_start * src_linesize;
+        uint16_t *hderivative = s->hderivative[plane] + slice_start * linesize;
+
+        if (!(s->planes & (1 << plane)))
+            continue;
+
+        for (int y = slice_start; y < slice_end; y++) {
+            for (int x = 0; x < width - 1; x++)
+                hderivative[x] = abs(src[x] - src[x + 1]);
+
+            src += src_linesize;
+            hderivative += linesize;
+        }
+    }
+
+    return 0;
+}
+
+static int hderivative16(AVFilterContext *ctx, void *arg,
+                         int jobnr, int nb_jobs)
+{
+    BilateralContext *s = ctx->priv;
+    ThreadData *td = arg;
+    AVFrame *in = td->in;
+
+    for (int plane = 0; plane < s->nb_planes; plane++) {
+        const int height = s->planeheight[plane];
+        const int width = s->planewidth[plane];
+        const int slice_start = (height * jobnr) / nb_jobs;
+        const int slice_end = (height * (jobnr+1)) / nb_jobs;
+        const int src_linesize = in->linesize[plane] / 2;
+        const int linesize = s->stride[plane];
+        const uint16_t *src = (const uint16_t *)in->data[plane] + slice_start * src_linesize;
+        uint16_t *hderivative = s->hderivative[plane] + slice_start * linesize;
+
+        if (!(s->planes & (1 << plane)))
+            continue;
+
+        for (int y = slice_start; y < slice_end; y++) {
+            for (int x = 0; x < width - 1; x++)
+                hderivative[x] = abs(src[x] - src[x + 1]);
+
+            src += src_linesize;
+            hderivative += linesize;
+        }
+    }
+
+    return 0;
+}
+
+static int vderivative(AVFilterContext *ctx, void *arg,
+                       int jobnr, int nb_jobs)
+{
+    BilateralContext *s = ctx->priv;
+    ThreadData *td = arg;
+    AVFrame *in = td->in;
+
+    for (int plane = 0; plane < s->nb_planes; plane++) {
+        const int height = s->planeheight[plane] - 1;
+        const int width = s->planewidth[plane];
+        const int slice_start = (height * jobnr) / nb_jobs;
+        const int slice_end = (height * (jobnr+1)) / nb_jobs;
+        const int src_linesize = in->linesize[plane];
+        const int linesize = s->stride[plane];
+        const uint8_t *src = in->data[plane] + slice_start * src_linesize;
+        uint16_t *vderivative = s->vderivative[plane] + slice_start * linesize;
+
+        if (!(s->planes & (1 << plane)))
+            continue;
 
         for (int y = slice_start; y < slice_end; y++) {
             for (int x = 0; x < width; x++)
-                dst[x] = (up_pass[x] + down_pass[x]) / (up_pass_factor[x] + down_pass_factor[x]);
+                vderivative[x] = abs(src[x] - src[x + src_linesize]);
 
-            dst += dst_linesize;
-            up_pass += up_pass_linesize;
-            up_pass_factor += up_pass_factor_linesize;
-            down_pass += down_pass_linesize;
-            down_pass_factor += down_pass_factor_linesize;
+            src += src_linesize;
+            vderivative += linesize;
+        }
+    }
+
+    return 0;
+}
+
+static int vderivative16(AVFilterContext *ctx, void *arg,
+                         int jobnr, int nb_jobs)
+{
+    BilateralContext *s = ctx->priv;
+    ThreadData *td = arg;
+    AVFrame *in = td->in;
+
+    for (int plane = 0; plane < s->nb_planes; plane++) {
+        const int height = s->planeheight[plane] - 1;
+        const int width = s->planewidth[plane];
+        const int slice_start = (height * jobnr) / nb_jobs;
+        const int slice_end = (height * (jobnr+1)) / nb_jobs;
+        const int src_linesize = in->linesize[plane] / 2;
+        const int linesize = s->stride[plane];
+        const uint16_t *src = (const uint16_t *)in->data[plane] + slice_start * src_linesize;
+        uint16_t *vderivative = s->vderivative[plane] + slice_start * linesize;
+
+        if (!(s->planes & (1 << plane)))
+            continue;
+
+        for (int y = slice_start; y < slice_end; y++) {
+            for (int x = 0; x < width; x++)
+                vderivative[x] = abs(src[x] - src[x + src_linesize]);
+
+            src += src_linesize;
+            vderivative += linesize;
         }
     }
 
@@ -401,15 +490,18 @@ static int input_pass(AVFilterContext *ctx, void *arg,
         const int slice_start = (height * jobnr) / nb_jobs;
         const int slice_end = (height * (jobnr+1)) / nb_jobs;
         const int src_linesize = in->linesize[plane];
-        const int dst_linesize = s->stride[plane];
+        const int linesize = s->stride[plane];
         const uint8_t *src = in->data[plane] + slice_start * src_linesize;
-        float *dst = (float *)s->input[plane] + slice_start * dst_linesize;
+        float *dst = s->input[plane] + slice_start * linesize;
+
+        if (!(s->planes & (1 << plane)))
+            continue;
 
         for (int y = slice_start; y < slice_end; y++) {
             for (int x = 0; x < width; x++)
                 dst[x] = src[x];
 
-            dst += dst_linesize;
+            dst += linesize;
             src += src_linesize;
         }
     }
@@ -432,7 +524,10 @@ static int input_pass16(AVFilterContext *ctx, void *arg,
         const int src_linesize = in->linesize[plane] / 2;
         const int dst_linesize = s->stride[plane];
         const uint16_t *src = (const uint16_t *)in->data[plane] + slice_start * src_linesize;
-        float *dst = (float *)s->input[plane] + slice_start * dst_linesize;
+        float *dst = s->input[plane] + slice_start * dst_linesize;
+
+        if (!(s->planes & (1 << plane)))
+            continue;
 
         for (int y = slice_start; y < slice_end; y++) {
             for (int x = 0; x < width; x++)
@@ -463,9 +558,9 @@ static int output_pass(AVFilterContext *ctx, void *arg,
         const int dst_linesize = out->linesize[plane];
         const int orig_linesize = in->linesize[plane];
         const int src_linesize = s->stride[plane];
-        const float *src = (const float *)s->output[plane] + slice_start * dst_linesize;
+        const float *src = (const float *)s->output[plane] + slice_start * src_linesize;
         const uint8_t *orig = in->data[plane] + slice_start * orig_linesize;
-        uint8_t *dst = out->data[plane] + slice_start * src_linesize;
+        uint8_t *dst = out->data[plane] + slice_start * dst_linesize;
 
          if (!(s->planes & (1 << plane))) {
              if (in != out)
@@ -503,13 +598,13 @@ static int output_pass16(AVFilterContext *ctx, void *arg,
         const int dst_linesize = out->linesize[plane] / 2;
         const int orig_linesize = in->linesize[plane];
         const int src_linesize = s->stride[plane];
-        const float *src = (const float *)s->output[plane] + slice_start * dst_linesize;
+        const float *src = (const float *)s->output[plane] + slice_start * src_linesize;
         const uint8_t *orig = in->data[plane] + slice_start * orig_linesize;
-        uint16_t *dst = (uint16_t *)out->data[plane] + slice_start * src_linesize;
+        uint16_t *dst = (uint16_t *)out->data[plane] + slice_start * dst_linesize;
 
          if (!(s->planes & (1 << plane))) {
              if (in != out)
-                 av_image_copy_plane((uint8_t *)dst, dst_linesize, orig, orig_linesize,
+                 av_image_copy_plane((uint8_t *)dst, dst_linesize * 2, orig, orig_linesize,
                                      width * ((s->depth + 7) / 8), slice_end - slice_start);
              continue;
         }
@@ -543,6 +638,9 @@ static int config_input(AVFilterLink *inlink)
 
     s->nb_planes = av_pix_fmt_count_planes(inlink->format);
 
+    s->hderivate_pass = s->depth <= 8 ? hderivative : hderivative16;
+    s->vderivate_pass = s->depth <= 8 ? vderivative : vderivative16;
+
     s->input_fun  = s->depth <= 8 ? input_pass  : input_pass16;
     s->output_fun = s->depth <= 8 ? output_pass : output_pass16;
 
@@ -550,6 +648,8 @@ static int config_input(AVFilterLink *inlink)
         int stride;
 
         s->stride[p] = stride   = FFALIGN(s->planewidth[p], 16);
+        s->hderivative[p]       = av_calloc(stride * s->planeheight[p], sizeof(uint16_t));
+        s->vderivative[p]       = av_calloc(stride * s->planeheight[p], sizeof(uint16_t));
         s->input[p]             = av_calloc(stride * s->planeheight[p], sizeof(float));
         s->output[p]            = av_calloc(stride * s->planeheight[p], sizeof(float));
         s->left_pass[p]         = av_calloc(stride * s->planeheight[p], sizeof(float));
@@ -573,6 +673,12 @@ static int config_input(AVFilterLink *inlink)
             return AVERROR(ENOMEM);
     }
 
+    s->sum_and_div_float = sum_and_div_float_c;
+
+    if (ARCH_X86) {
+        ff_bilateral_init_x86(s);
+    }
+
     return 0;
 }
 
@@ -587,6 +693,12 @@ static int bilateral_planes(AVFilterContext *ctx,
     td.in = in;
     td.out = out;
     ff_filter_execute(ctx, s->input_fun, &td, NULL,
+                      FFMIN(s->planeheight[1], nb_threads));
+
+    ff_filter_execute(ctx, s->hderivate_pass, &td, NULL,
+                      FFMIN(s->planeheight[1], nb_threads));
+
+    ff_filter_execute(ctx, s->vderivate_pass, &td, NULL,
                       FFMIN(s->planeheight[1], nb_threads));
 
     ff_filter_execute(ctx, left_pass, NULL, NULL,
@@ -642,6 +754,9 @@ static av_cold void uninit(AVFilterContext *ctx)
     BilateralContext *s = ctx->priv;
 
     for (int p = 0; p < s->nb_planes; p++) {
+        av_freep(&s->hderivative[p]);
+        av_freep(&s->vderivative[p]);
+
         av_freep(&s->input[p]);
         av_freep(&s->output[p]);
 
