@@ -29,12 +29,20 @@
 #include "internal.h"
 #include "video.h"
 
+enum Kernel {
+    GAUSSIAN,
+    LINEAR_DESCENT,
+    NB_KERNELS
+};
+
 typedef struct BilateralContext {
     const AVClass *class;
 
     float sigmaS;
     float sigmaR;
     int planes;
+    int kernelS;
+    int kernelR;
 
     int nb_threads;
     int nb_planes;
@@ -62,6 +70,10 @@ static const AVOption bilateral_options[] = {
     { "sigmaS", "set spatial sigma",    OFFSET(sigmaS), AV_OPT_TYPE_FLOAT, {.dbl=0.1}, 0.0, 512, FLAGS },
     { "sigmaR", "set range sigma",      OFFSET(sigmaR), AV_OPT_TYPE_FLOAT, {.dbl=0.1}, 0.0,   1, FLAGS },
     { "planes", "set planes to filter", OFFSET(planes), AV_OPT_TYPE_INT,   {.i64=1},     0, 0xF, FLAGS },
+    { "kernelS", "set spatial kernel",  OFFSET(kernelS),AV_OPT_TYPE_INT,   {.i64=0},     0, NB_KERNELS-1, FLAGS, "kernel" },
+    { "kernelR", "set range kernel",    OFFSET(kernelR),AV_OPT_TYPE_INT,   {.i64=0},     0, NB_KERNELS-1, FLAGS, "kernel" },
+    { "gaussian", "gaussian",           0,              AV_OPT_TYPE_CONST, {.i64=GAUSSIAN},       0, 0, FLAGS, "kernel" },
+    { "ldescent", "linear descent",     0,              AV_OPT_TYPE_CONST, {.i64=LINEAR_DESCENT}, 0, 0, FLAGS, "kernel" },
     { NULL }
 };
 
@@ -91,14 +103,28 @@ static const enum AVPixelFormat pix_fmts[] = {
 static int config_params(AVFilterContext *ctx)
 {
     BilateralContext *s = ctx->priv;
-    float inv_sigma_range;
+    float scale = 1.f / ((1 << s->depth) - 1);
+    float inv_sigma_range = scale / s->sigmaR;
 
-    inv_sigma_range = 1.0f / (s->sigmaR * ((1 << s->depth) - 1));
-    s->alpha = expf(-sqrtf(2.f) / s->sigmaS);
+    switch (s->kernelS) {
+    case GAUSSIAN:
+        s->alpha = expf(-sqrtf(2.f) / s->sigmaS);
+        break;
+    case LINEAR_DESCENT:
+        s->alpha = 1.f - (1.f / sqrtf(fmaxf(s->sigmaS, 1.f)));
+        break;
+    }
 
-    //compute a lookup table
-    for (int i = 0; i < (1 << s->depth); i++)
-        s->range_table[i] = s->alpha * expf(-i * inv_sigma_range);
+    switch (s->kernelR) {
+    case GAUSSIAN:
+        for (int i = 0; i < (1 << s->depth); i++)
+            s->range_table[i] = s->alpha * expf(-i * inv_sigma_range);
+        break;
+    case LINEAR_DESCENT:
+        for (int i = 0; i < (1 << s->depth); i++)
+            s->range_table[i] = s->alpha * ((i * scale <= s->sigmaR) ? 1.f - i * inv_sigma_range : 0.f);
+        break;
+    }
 
     return 0;
 }
