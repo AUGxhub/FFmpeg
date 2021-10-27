@@ -479,6 +479,7 @@ extern const AVFilter ff_vf_vstack;
 extern const AVFilter ff_vf_w3fdif;
 extern const AVFilter ff_vf_waveform;
 extern const AVFilter ff_vf_weave;
+extern const AVFilter ff_vf_wpsnr;
 extern const AVFilter ff_vf_xbr;
 extern const AVFilter ff_vf_xcorrelate;
 extern const AVFilter ff_vf_xfade;
