@@ -57,6 +57,8 @@ static const AVOption filtergraph_options[] = {
         AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, F|V },
     {"aresample_swr_opts"   , "default aresample filter options"    , OFFSET(aresample_swr_opts)    ,
         AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, F|A },
+    {"shortest", "ends filtering with shortest sink"                , OFFSET(shortest)              ,
+        AV_OPT_TYPE_BOOL,   {.i64 = 0}, 0, 1, F|V|A },
     { NULL },
 };
 
@@ -77,6 +79,7 @@ int ff_graph_thread_init(AVFilterGraph *graph)
 {
     graph->thread_type = 0;
     graph->nb_threads  = 1;
+    graph->shortest    = 0;
     return 0;
 }
 #endif
@@ -1298,7 +1301,7 @@ int avfilter_graph_request_oldest(AVFilterGraph *graph)
         } else {
             r = ff_request_frame(oldest);
         }
-        if (r != AVERROR_EOF)
+        if (r != AVERROR_EOF || graph->shortest)
             break;
         av_log(oldest->dst, AV_LOG_DEBUG, "EOF on sink link %s:%s.\n",
                oldest->dst->name,
@@ -1309,7 +1312,7 @@ int avfilter_graph_request_oldest(AVFilterGraph *graph)
                              oldest->age_index);
         oldest->age_index = -1;
     }
-    if (!graph->sink_links_count)
+    if (!graph->sink_links_count || (r == AVERROR_EOF && graph->shortest))
         return AVERROR_EOF;
     av_assert1(!oldest->dst->filter->activate);
     av_assert1(oldest->age_index >= 0);

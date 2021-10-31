@@ -909,6 +909,7 @@ typedef struct AVFilterGraph {
     int sink_links_count;
 
     unsigned disable_auto_convert;
+    int shortest;
 } AVFilterGraph;
 
 /**

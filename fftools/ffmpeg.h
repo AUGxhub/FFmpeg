@@ -633,6 +633,7 @@ extern char *videotoolbox_pixfmt;
 
 extern char *filter_nbthreads;
 extern int filter_complex_nbthreads;
+extern int filter_shortest;
 extern int vstats_version;
 extern int auto_conversion_filters;
 

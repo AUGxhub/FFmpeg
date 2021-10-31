@@ -1028,6 +1028,7 @@ int configure_filtergraph(FilterGraph *fg)
         av_opt_set(fg->graph, "aresample_swr_opts", args, 0);
     } else {
         fg->graph->nb_threads = filter_complex_nbthreads;
+        fg->graph->shortest = filter_shortest;
     }
 
     if ((ret = avfilter_graph_parse2(fg->graph, graph_desc, &inputs, &outputs)) < 0)

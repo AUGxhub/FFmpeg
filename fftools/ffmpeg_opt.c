@@ -171,6 +171,7 @@ int frame_bits_per_raw_sample = 0;
 float max_error_rate  = 2.0/3;
 char *filter_nbthreads;
 int filter_complex_nbthreads = 0;
+int filter_shortest = 0;
 int vstats_version = 2;
 int auto_conversion_filters = 1;
 int64_t stats_period = 500000;
@@ -3638,6 +3639,8 @@ const OptionDef options[] = {
         "create a complex filtergraph", "graph_description" },
     { "filter_complex_threads", HAS_ARG | OPT_INT,                   { &filter_complex_nbthreads },
         "number of threads for -filter_complex" },
+    { "filter_shortest", OPT_BOOL | OPT_INT,                         { &filter_shortest },
+        "ends filtering on shortest sink" },
     { "lavfi",          HAS_ARG | OPT_EXPERT,                        { .func_arg = opt_filter_complex },
         "create a complex filtergraph", "graph_description" },
     { "filter_complex_script", HAS_ARG | OPT_EXPERT,                 { .func_arg = opt_filter_complex_script },
