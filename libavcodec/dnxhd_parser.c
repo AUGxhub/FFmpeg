@@ -62,7 +62,14 @@ static int dnxhd_find_frame_end(DNXHDParserContext *dctx,
             dctx->cur_byte++;
             state = (state << 8) | buf[i];
 
-            if (dctx->cur_byte == 24) {
+            if (dctx->cur_byte > 42 && (state & 0xFFFFFFFF) == 0x600DC0DE) {
+                int remaining = i + 1;
+                pc->frame_start_found = 0;
+                pc->state64 = -1;
+                dctx->cur_byte = 0;
+                dctx->remaining = 0;
+                return remaining;
+            } else if (dctx->cur_byte == 24) {
                 dctx->h = (state >> 32) & 0xFFFF;
             } else if (dctx->cur_byte == 26) {
                 dctx->w = (state >> 32) & 0xFFFF;
@@ -74,11 +81,8 @@ static int dnxhd_find_frame_end(DNXHDParserContext *dctx,
                     continue;
 
                 remaining = avpriv_dnxhd_get_frame_size(cid);
-                if (remaining <= 0) {
-                    remaining = avpriv_dnxhd_get_hr_frame_size(cid, dctx->w, dctx->h);
-                    if (remaining <= 0)
-                        continue;
-                }
+                if (remaining <= 0)
+                    continue;
                 remaining += i - 47;
                 dctx->remaining = remaining;
                 if (buf_size >= dctx->remaining) {
