@@ -58,6 +58,7 @@ extern const AVFilter ff_af_allpass;
 extern const AVFilter ff_af_aloop;
 extern const AVFilter ff_af_amerge;
 extern const AVFilter ff_af_ametadata;
+extern const AVFilter ff_af_ametagain;
 extern const AVFilter ff_af_amix;
 extern const AVFilter ff_af_amultiply;
 extern const AVFilter ff_af_anequalizer;
