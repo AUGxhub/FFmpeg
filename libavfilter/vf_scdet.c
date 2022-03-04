@@ -30,12 +30,17 @@
 #include "filters.h"
 #include "scene_sad.h"
 
+typedef struct SCDetScore {
+    uint64_t sad[4];
+    uint64_t count[4];
+} SCDetScore;
+
 typedef struct SCDetContext {
     const AVClass *class;
 
-    int linesizes[4];
     int planewidth[4];
     int planeheight[4];
+    int nb_threads;
     int nb_planes;
     int planes;
     int bitdepth;
@@ -45,6 +50,8 @@ typedef struct SCDetContext {
     AVFrame *prev_picref;
     double threshold;
     int sc_pass;
+
+    SCDetScore *scores;
 } SCDetContext;
 
 #define OFFSET(x) offsetof(SCDetContext, x)
@@ -64,8 +71,8 @@ static const AVOption scdet_options[] = {
 AVFILTER_DEFINE_CLASS(scdet);
 
 static const enum AVPixelFormat pix_fmts[] = {
-        AV_PIX_FMT_RGB24, AV_PIX_FMT_BGR24, AV_PIX_FMT_RGBA,
-        AV_PIX_FMT_ABGR, AV_PIX_FMT_BGRA, AV_PIX_FMT_GRAY8,
+        AV_PIX_FMT_GRAY8,
+        AV_PIX_FMT_GBRP, AV_PIX_FMT_GBRP9, AV_PIX_FMT_GBRP10, AV_PIX_FMT_GBRP12,
         AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUVJ420P,
         AV_PIX_FMT_YUV422P, AV_PIX_FMT_YUVJ422P,
         AV_PIX_FMT_YUV440P, AV_PIX_FMT_YUVJ440P,
@@ -81,12 +88,10 @@ static int config_input(AVFilterLink *inlink)
     AVFilterContext *ctx = inlink->dst;
     SCDetContext *s = ctx->priv;
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(inlink->format);
-    int ret;
 
+    s->nb_threads = ff_filter_get_nb_threads(ctx);
     s->bitdepth = desc->comp[0].depth;
     s->nb_planes = av_pix_fmt_count_planes(inlink->format);
-    if ((ret = av_image_fill_linesizes(s->linesizes, inlink->format, inlink->w)) < 0)
-        return ret;
 
     s->planeheight[1] = s->planeheight[2] = AV_CEIL_RSHIFT(inlink->h, desc->log2_chroma_h);
     s->planeheight[0] = s->planeheight[3] = inlink->h;
@@ -97,6 +102,10 @@ static int config_input(AVFilterLink *inlink)
     if (!s->sad)
         return AVERROR(EINVAL);
 
+    s->scores = av_calloc(s->nb_threads, sizeof(*s->scores));
+    if (!s->scores)
+        return AVERROR(ENOMEM);
+
     return 0;
 }
 
@@ -105,6 +114,38 @@ static av_cold void uninit(AVFilterContext *ctx)
     SCDetContext *s = ctx->priv;
 
     av_frame_free(&s->prev_picref);
+    av_freep(&s->scores);
+}
+
+static int compute_sad(AVFilterContext *ctx, void *arg,
+                       int jobnr, int nb_jobs)
+{
+    SCDetContext *s = ctx->priv;
+    AVFrame *frame = arg;
+    AVFrame *prev_picref = s->prev_picref;
+
+    for (int plane = 0; plane < s->nb_planes; plane++) {
+        const int outw = s->planewidth[plane];
+        const int outh = s->planeheight[plane];
+        const int slice_start = (outh * jobnr) / nb_jobs;
+        const int slice_end = (outh * (jobnr+1)) / nb_jobs;
+        SCDetScore *score = &s->scores[jobnr];
+        uint64_t plane_sad;
+
+        if (!(s->planes & (1 << plane)))
+            continue;
+
+        s->sad(prev_picref->data[plane] + slice_start * prev_picref->linesize[plane],
+               prev_picref->linesize[plane],
+               frame->data[plane] + slice_start * frame->linesize[plane],
+               frame->linesize[plane],
+               outw, slice_end - slice_start, &plane_sad);
+
+        score->sad[plane] = plane_sad;
+        score->count[plane] = outw * (slice_end - slice_start);
+    }
+
+    return 0;
 }
 
 static double get_scene_score(AVFilterContext *ctx, AVFrame *frame)
@@ -118,17 +159,17 @@ static double get_scene_score(AVFilterContext *ctx, AVFrame *frame)
         double mafd, diff;
         uint64_t count = 0;
 
-        for (int plane = 0; plane < s->nb_planes; plane++) {
-            uint64_t plane_sad;
+        ff_filter_execute(ctx, compute_sad, frame, NULL,
+                          FFMIN(s->planeheight[1], s->nb_threads));
 
-            if (!(s->planes & (1 << plane)))
-                continue;
+        for (int t = 0; t < s->nb_threads; t++) {
+            for (int plane = 0; plane < s->nb_planes; plane++) {
+                if (!(s->planes & (1 << plane)))
+                    continue;
 
-            s->sad(prev_picref->data[plane], prev_picref->linesize[plane],
-                    frame->data[plane], frame->linesize[plane],
-                    s->planewidth[plane], s->planeheight[plane], &plane_sad);
-            sad += plane_sad;
-            count += s->planewidth[plane] * s->planeheight[plane];
+                sad += s->scores[t].sad[plane];
+                count += s->scores[t].count[plane];
+            }
         }
 
         emms_c();
@@ -163,6 +204,10 @@ static int activate(AVFilterContext *ctx)
 
     if (frame) {
         char buf[64];
+
+        if (ctx->is_disabled)
+            return ff_filter_frame(outlink, frame);
+
         s->scene_score = get_scene_score(ctx, frame);
         snprintf(buf, sizeof(buf), "%0.3f", s->prev_mafd);
         set_meta(s, frame, "lavfi.scd.mafd", buf);
@@ -212,9 +257,11 @@ const AVFilter ff_vf_scdet = {
     .priv_size     = sizeof(SCDetContext),
     .priv_class    = &scdet_class,
     .uninit        = uninit,
-    .flags         = AVFILTER_FLAG_METADATA_ONLY,
     FILTER_INPUTS(scdet_inputs),
     FILTER_OUTPUTS(scdet_outputs),
     FILTER_PIXFMTS_ARRAY(pix_fmts),
     .activate      = activate,
+    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL |
+                     AVFILTER_FLAG_SLICE_THREADS             |
+                     AVFILTER_FLAG_METADATA_ONLY,
 };
