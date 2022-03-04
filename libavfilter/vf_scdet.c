@@ -33,9 +33,11 @@
 typedef struct SCDetContext {
     const AVClass *class;
 
-    ptrdiff_t width[4];
-    ptrdiff_t height[4];
+    int linesizes[4];
+    int planewidth[4];
+    int planeheight[4];
     int nb_planes;
+    int planes;
     int bitdepth;
     ff_scene_sad_fn sad;
     double prev_mafd;
@@ -50,10 +52,12 @@ typedef struct SCDetContext {
 #define F AV_OPT_FLAG_FILTERING_PARAM
 
 static const AVOption scdet_options[] = {
-    { "threshold",   "set scene change detect threshold",        OFFSET(threshold),  AV_OPT_TYPE_DOUBLE,   {.dbl = 10.},     0,  100., V|F },
-    { "t",           "set scene change detect threshold",        OFFSET(threshold),  AV_OPT_TYPE_DOUBLE,   {.dbl = 10.},     0,  100., V|F },
-    { "sc_pass",     "Set the flag to pass scene change frames", OFFSET(sc_pass),    AV_OPT_TYPE_BOOL,     {.dbl =  0  },    0,    1,  V|F },
-    { "s",           "Set the flag to pass scene change frames", OFFSET(sc_pass),    AV_OPT_TYPE_BOOL,     {.dbl =  0  },    0,    1,  V|F },
+    { "threshold", "set scene change detect threshold",        OFFSET(threshold), AV_OPT_TYPE_DOUBLE, {.dbl = 10.}, 0,  100., V|F },
+    { "t",         "set scene change detect threshold",        OFFSET(threshold), AV_OPT_TYPE_DOUBLE, {.dbl = 10.}, 0,  100., V|F },
+    { "sc_pass",   "set the flag to pass scene change frames", OFFSET(sc_pass),   AV_OPT_TYPE_BOOL,   {.dbl =  0},  0,    1,  V|F },
+    { "s",         "set the flag to pass scene change frames", OFFSET(sc_pass),   AV_OPT_TYPE_BOOL,   {.dbl =  0},  0,    1,  V|F },
+    { "planes",    "set what planes to filter",                OFFSET(planes),    AV_OPT_TYPE_FLAGS,  {.i64 = 1},   0,   15,  V|F },
+    { "p",         "set what planes to filter",                OFFSET(planes),    AV_OPT_TYPE_FLAGS,  {.i64 = 1},   0,   15,  V|F },
     {NULL}
 };
 
@@ -77,18 +81,17 @@ static int config_input(AVFilterLink *inlink)
     AVFilterContext *ctx = inlink->dst;
     SCDetContext *s = ctx->priv;
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(inlink->format);
-    int is_yuv = !(desc->flags & AV_PIX_FMT_FLAG_RGB) &&
-        (desc->flags & AV_PIX_FMT_FLAG_PLANAR) &&
-        desc->nb_components >= 3;
+    int ret;
 
     s->bitdepth = desc->comp[0].depth;
-    s->nb_planes = is_yuv ? 1 : av_pix_fmt_count_planes(inlink->format);
+    s->nb_planes = av_pix_fmt_count_planes(inlink->format);
+    if ((ret = av_image_fill_linesizes(s->linesizes, inlink->format, inlink->w)) < 0)
+        return ret;
 
-    for (int plane = 0; plane < 4; plane++) {
-        ptrdiff_t line_size = av_image_get_linesize(inlink->format, inlink->w, plane);
-        s->width[plane] = line_size >> (s->bitdepth > 8);
-        s->height[plane] = inlink->h >> ((plane == 1 || plane == 2) ? desc->log2_chroma_h : 0);
-    }
+    s->planeheight[1] = s->planeheight[2] = AV_CEIL_RSHIFT(inlink->h, desc->log2_chroma_h);
+    s->planeheight[0] = s->planeheight[3] = inlink->h;
+    s->planewidth[1]  = s->planewidth[2]  = AV_CEIL_RSHIFT(inlink->w, desc->log2_chroma_w);
+    s->planewidth[0]  = s->planewidth[3]  = inlink->w;
 
     s->sad = ff_scene_sad_get_fn(s->bitdepth == 8 ? 8 : 16);
     if (!s->sad)
@@ -110,19 +113,22 @@ static double get_scene_score(AVFilterContext *ctx, AVFrame *frame)
     SCDetContext *s = ctx->priv;
     AVFrame *prev_picref = s->prev_picref;
 
-    if (prev_picref && frame->height == prev_picref->height
-                    && frame->width  == prev_picref->width) {
+    if (prev_picref) {
         uint64_t sad = 0;
         double mafd, diff;
         uint64_t count = 0;
 
         for (int plane = 0; plane < s->nb_planes; plane++) {
             uint64_t plane_sad;
+
+            if (!(s->planes & (1 << plane)))
+                continue;
+
             s->sad(prev_picref->data[plane], prev_picref->linesize[plane],
                     frame->data[plane], frame->linesize[plane],
-                    s->width[plane], s->height[plane], &plane_sad);
+                    s->planewidth[plane], s->planeheight[plane], &plane_sad);
             sad += plane_sad;
-            count += s->width[plane] * s->height[plane];
+            count += s->planewidth[plane] * s->planeheight[plane];
         }
 
         emms_c();
