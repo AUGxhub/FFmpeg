@@ -169,6 +169,7 @@ OBJS-$(CONFIG_AEVALSRC_FILTER)               += aeval.o
 OBJS-$(CONFIG_AFIRSRC_FILTER)                += asrc_afirsrc.o
 OBJS-$(CONFIG_ANOISESRC_FILTER)              += asrc_anoisesrc.o
 OBJS-$(CONFIG_ANULLSRC_FILTER)               += asrc_anullsrc.o
+OBJS-$(CONFIG_ATONE_FILTER)                  += asrc_atone.o
 OBJS-$(CONFIG_FLITE_FILTER)                  += asrc_flite.o
 OBJS-$(CONFIG_HILBERT_FILTER)                += asrc_hilbert.o
 OBJS-$(CONFIG_SINC_FILTER)                   += asrc_sinc.o
