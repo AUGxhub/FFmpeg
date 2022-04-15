@@ -165,6 +165,9 @@ static const PixelFormatTag raw_pix_fmt_tags[] = {
     { AV_PIX_FMT_YA8,         MKTAG('Y', '2',  0 ,  8 ) },
     { AV_PIX_FMT_PAL8,        MKTAG('P', 'A', 'L',  8 ) },
 
+    { AV_PIX_FMT_GRAYF32LE,    MKTAG('Y', '1',  0 , 32 ) },
+    { AV_PIX_FMT_GRAYF32BE,    MKTAG(32 ,  0 , '1', 'Y') },
+
     { AV_PIX_FMT_YUVA420P9LE,  MKTAG('Y', '4', 11 ,  9 ) },
     { AV_PIX_FMT_YUVA420P9BE,  MKTAG( 9 , 11 , '4', 'Y') },
     { AV_PIX_FMT_YUVA422P9LE,  MKTAG('Y', '4', 10 ,  9 ) },
@@ -200,6 +203,9 @@ static const PixelFormatTag raw_pix_fmt_tags[] = {
     { AV_PIX_FMT_GBRP16LE,     MKTAG('G', '3', 00 , 16 ) },
     { AV_PIX_FMT_GBRP16BE,     MKTAG(16 , 00 , '3', 'G') },
 
+    { AV_PIX_FMT_GBRPF32LE,    MKTAG('G', '3', 00 , 32 ) },
+    { AV_PIX_FMT_GBRPF32BE,    MKTAG(32 , 00 , '3', 'G') },
+
     { AV_PIX_FMT_GBRAP,        MKTAG('G', '4', 00 ,  8 ) },
     { AV_PIX_FMT_GBRAP10LE,    MKTAG('G', '4', 00 , 10 ) },
     { AV_PIX_FMT_GBRAP10BE,    MKTAG(10 , 00 , '4', 'G') },
@@ -207,6 +213,9 @@ static const PixelFormatTag raw_pix_fmt_tags[] = {
     { AV_PIX_FMT_GBRAP12BE,    MKTAG(12 , 00 , '4', 'G') },
     { AV_PIX_FMT_GBRAP16LE,    MKTAG('G', '4', 00 , 16 ) },
     { AV_PIX_FMT_GBRAP16BE,    MKTAG(16 , 00 , '4', 'G') },
+
+    { AV_PIX_FMT_GBRAPF32LE,   MKTAG('G', '4', 00 , 32 ) },
+    { AV_PIX_FMT_GBRAPF32BE,   MKTAG(32 , 00 , '4', 'G') },
 
     { AV_PIX_FMT_XYZ12LE,      MKTAG('X', 'Y', 'Z' , 36 ) },
     { AV_PIX_FMT_XYZ12BE,      MKTAG(36 , 'Z' , 'Y', 'X') },
